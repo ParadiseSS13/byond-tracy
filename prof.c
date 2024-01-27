@@ -51,6 +51,7 @@
 #	define likely(expr) (expr)
 #	define unlikely(expr) (expr)
 #endif
+#define UTRACY_ALIGN_DOWN(ptr, size) ((void *) ((uintptr_t) (ptr) & (~((size) - 1))))
 
 /* data type size check */
 _Static_assert(sizeof(void *) == 4, "incorrect size");
@@ -121,6 +122,8 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 #	include <arpa/inet.h>
 #	include <poll.h>
 #	include <fcntl.h>
+/* avoid including stdlib.h */
+char *getenv(char const *);
 #endif
 
 #include <stddef.h>
@@ -218,6 +221,10 @@ size_t strlen(char const *const a) {
 #	define UTRACY_MEMCMP memcmp
 #endif
 
+#if defined(UTRACY_LINUX)
+#	define _fileno fileno
+#endif
+
 
 /* debugging */
 #if defined(UTRACY_DEBUG) || defined(DEBUG)
@@ -230,6 +237,9 @@ size_t strlen(char const *const a) {
 #endif
 
 /* config */
+#define UTRACY_L1_LINE_SIZE (64)
+#define UTRACY_PAGE_SIZE (4096)
+
 #define EVENT_QUEUE_CAPACITY (1u << 18u)
 _Static_assert((EVENT_QUEUE_CAPACITY & (EVENT_QUEUE_CAPACITY - 1)) == 0, "EVENT_QUEUE_CAPACITY must be a power of 2");
 
@@ -391,6 +401,11 @@ static struct {
 	int (UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL *orig_server_tick)(void);
 	void *send_maps;
 	void (UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL *orig_send_maps)(void);
+	_Alignas(UTRACY_PAGE_SIZE) struct {
+		char exec_proc[32];
+		char server_tick[32];
+		char send_maps[32];
+	} trampoline;
 } byond;
 
 static struct {
@@ -414,9 +429,9 @@ static struct {
 		int unsigned consumer_head_cache;
 		struct event events[EVENT_QUEUE_CAPACITY];
 
-		_Alignas(64) atomic_uint head;
-        _Alignas(64) atomic_uint tail;
-        _Alignas(64) int padding;
+		_Alignas(UTRACY_L1_LINE_SIZE) atomic_uint head;
+		_Alignas(UTRACY_L1_LINE_SIZE) atomic_uint tail;
+		_Alignas(UTRACY_L1_LINE_SIZE) int padding;
 	} queue;
 } utracy;
 
@@ -1034,23 +1049,10 @@ void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
 
 /* hooking */
 UTRACY_INTERNAL
-void *hook(char *const restrict dst, char *const restrict src, char unsigned size) {
+void *hook(char *const restrict dst, char *const restrict src, char unsigned size, char *trampoline) {
 	char unsigned jmp[] = {
 		0xE9, 0x00, 0x00, 0x00, 0x00
 	};
-
-#if defined(UTRACY_WINDOWS)
-	char *trampoline = VirtualAlloc(NULL, 4096, MEM_COMMIT, PAGE_READWRITE);
-
-#elif defined(UTRACY_LINUX)
-	long page_size = sysconf(_SC_PAGE_SIZE);
-	char *trampoline = aligned_alloc(page_size, page_size);
-
-#endif
-
-	if(NULL == trampoline) {
-		return NULL;
-	}
 
 	uintptr_t jmp_from = (uintptr_t) trampoline + size + sizeof(jmp);
 	uintptr_t jmp_to = (uintptr_t) src + size;
@@ -1059,38 +1061,20 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 	(void) UTRACY_MEMCPY(trampoline, src, size);
 	(void) UTRACY_MEMCPY(trampoline + size, jmp, sizeof(jmp));
 
-#if defined(UTRACY_WINDOWS)
-	DWORD old_protect;
-	if(0 == VirtualProtect(trampoline, 4096, PAGE_EXECUTE_READWRITE, &old_protect)) {
-		LOG_DEBUG_ERROR;
-		(void) VirtualFree(trampoline, 0, MEM_RELEASE);
-		return NULL;
-	}
-
-#elif defined(UTRACY_LINUX)
-	if(0 != mprotect(trampoline, page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
-		LOG_DEBUG_ERROR;
-		free(trampoline);
-		return NULL;
-	}
-
-#endif
-
 	jmp_from = (uintptr_t) src + sizeof(jmp);
 	jmp_to = (uintptr_t) dst;
 	offset = jmp_to - jmp_from;
 
 #if defined(UTRACY_WINDOWS)
+	DWORD old_protect;
 	if(0 == VirtualProtect(src, size, PAGE_READWRITE, &old_protect)) {
 		LOG_DEBUG_ERROR;
-		(void) VirtualFree(trampoline, 0, MEM_RELEASE);
 		return NULL;
 	}
 
 #elif defined(UTRACY_LINUX)
-	if(0 != mprotect((void *) ((uintptr_t) src & ((uintptr_t) -page_size)), page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
+	if(0 != mprotect(UTRACY_ALIGN_DOWN(src, UTRACY_PAGE_SIZE), UTRACY_PAGE_SIZE, PROT_WRITE | PROT_READ)) {
 		LOG_DEBUG_ERROR;
-		free(trampoline);
 		return NULL;
 	}
 
@@ -1113,7 +1097,7 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 	}
 
 #elif defined(UTRACY_LINUX)
-	if(0 != mprotect((void *) ((uintptr_t) src & (uintptr_t) -page_size), page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
+	if(0 != mprotect(UTRACY_ALIGN_DOWN(src, UTRACY_PAGE_SIZE), UTRACY_PAGE_SIZE, PROT_READ | PROT_EXEC)) {
 		LOG_DEBUG_ERROR;
 		return NULL;
 	}
@@ -1538,23 +1522,38 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	LOG_INFO("byond build = %d\n", byond_build);
 
-	byond.orig_exec_proc = hook((void *) exec_proc, byond.exec_proc, prologues[0]);
+	byond.orig_exec_proc = hook((void *) exec_proc, byond.exec_proc, prologues[0], byond.trampoline.exec_proc);
 	if(NULL == byond.orig_exec_proc) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook exec_proc";
 	}
 
-	byond.orig_server_tick = hook((void *) server_tick, byond.server_tick, prologues[1]);
+	byond.orig_server_tick = hook((void *) server_tick, byond.server_tick, prologues[1], byond.trampoline.server_tick);
 	if(NULL == byond.orig_server_tick) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook server_tick";
 	}
 
-	byond.orig_send_maps = hook((void *) send_maps, byond.send_maps, prologues[2]);
+	byond.orig_send_maps = hook((void *) send_maps, byond.send_maps, prologues[2], byond.trampoline.send_maps);
 	if(NULL == byond.orig_send_maps) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook send_maps";
 	}
+
+#if defined(UTRACY_WINDOWS)
+	DWORD old_protect;
+	if(0 == VirtualProtect(&byond.trampoline, UTRACY_PAGE_SIZE, PAGE_EXECUTE_READ, &old_protect)) {
+		LOG_DEBUG_ERROR;
+		return "failed to set trampoline access protection";
+	}
+
+#elif defined(UTRACY_LINUX)
+	if(0 != mprotect(&byond.trampoline, UTRACY_PAGE_SIZE, PROT_READ | PROT_EXEC)) {
+		LOG_DEBUG_ERROR;
+		return "failed to set trampoline access protection";
+	}
+
+#endif
 
 	build_srclocs();
 
@@ -1696,7 +1695,7 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
 	return "0";
 }
 
-#if (__STDC_HOSTED__ == 0)
+#if (__STDC_HOSTED__ == 0) && defined(UTRACY_WINDOWS)
 BOOL WINAPI DllMainCRTStartup(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 	return TRUE;
 }
