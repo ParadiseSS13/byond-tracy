@@ -675,7 +675,7 @@ struct utracy_source_location {
 	int unsigned color;
 };
 
-static struct utracy_source_location srclocs[0x10002];
+static struct utracy_source_location srclocs[0x14002];
 
 UTRACY_INTERNAL UTRACY_INLINE
 void utracy_emit_zone_begin(int unsigned proc) {
@@ -895,7 +895,7 @@ void *utracy_server_thread_start(void *user) {
 /* byond hooks */
 UTRACY_INTERNAL
 struct object UTRACY_WINDOWS_CDECL UTRACY_LINUX_REGPARM(3) exec_proc(struct proc *proc) {
-	if(likely(proc->procdef < 0x10000)) {
+	if(likely(proc->procdef < 0x14000)) {
 		utracy_emit_zone_begin(proc->procdef);
 
 		/* procs with pre-existing contexts are resuming from sleep */
@@ -918,7 +918,7 @@ int UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL server_tick(void) {
 	/* server tick is the end of a frame and the beginning of the next frame */
 	utracy_emit_frame_mark(NULL);
 
-	utracy_emit_zone_begin(0x10000);
+	utracy_emit_zone_begin(0x14000);
 
 	int interval = byond.orig_server_tick();
 
@@ -929,7 +929,7 @@ int UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL server_tick(void) {
 
 UTRACY_INTERNAL
 void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
-	utracy_emit_zone_begin(0x10001);
+	utracy_emit_zone_begin(0x14001);
 
 	byond.orig_send_maps();
 
@@ -1182,7 +1182,7 @@ void build_srclocs(void) {
 #define byond_get_misc(id) (id < *byond.miscs_len ? *(*byond.miscs + id) : NULL)
 #define byond_get_procdef(id) (void *)((id < *byond.procdefs_len ? ((char *)(*byond.procdefs)) + id * byond.procdef_size : NULL))
 
-	for(int unsigned i=0; i<0x10000; i++) {
+	for(int unsigned i=0; i<0x14000; i++) {
 		char const *name = NULL;
 		char const *function = "<?>";
 		char const *file = "<?.dm>";
@@ -1227,7 +1227,7 @@ void build_srclocs(void) {
 		};
 	}
 
-	srclocs[0x10000] = (struct utracy_source_location) {
+	srclocs[0x14000] = (struct utracy_source_location) {
 		.name = NULL,
 		.function = "ServerTick",
 		.file = __FILE__,
@@ -1235,7 +1235,7 @@ void build_srclocs(void) {
 		.color = 0x44AF44
 	};
 
-	srclocs[0x10001] = (struct utracy_source_location) {
+	srclocs[0x14001] = (struct utracy_source_location) {
 		.name = NULL,
 		.function = "SendMaps",
 		.file = __FILE__,
