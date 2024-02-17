@@ -232,6 +232,8 @@ size_t strlen(char const *const a) {
 #define EVENT_QUEUE_CAPACITY (1u << 18u)
 _Static_assert((EVENT_QUEUE_CAPACITY & (EVENT_QUEUE_CAPACITY - 1)) == 0, "EVENT_QUEUE_CAPACITY must be a power of 2");
 
+static int byond_build = 0;
+
 /* byond types */
 struct object {
 	union {
@@ -255,6 +257,19 @@ struct string {
 };
 
 struct procdef {
+	int unsigned path;
+	int unsigned name;
+	int unsigned desc;
+	int unsigned category;
+	int unsigned flags;
+	int unsigned unk0;
+	int unsigned unk1;
+	int unsigned bytecode;
+	int unsigned locals;
+	int unsigned parameters;
+};
+
+struct procdef_legacy {
 	int unsigned path;
 	int unsigned name;
 	int unsigned desc;
@@ -1003,8 +1018,9 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 }
 
 #if defined(UTRACY_WINDOWS)
-#	define BYOND_MAX_BUILD 1623
+#	define BYOND_MAX_BUILD 1630
 #	define BYOND_MIN_BUILD 1543
+# define BYOND_LEGACY_MAX 1623
 #	define BYOND_VERSION_ADJUSTED(a) ((a) - BYOND_MIN_BUILD)
 
 static int unsigned const byond_offsets[][9] = {
@@ -1090,11 +1106,13 @@ static int unsigned const byond_offsets[][9] = {
 	[BYOND_VERSION_ADJUSTED(1621)] = {0x0040758C, 0x00407590, 0x0040759C, 0x004075AC,       0x28, 0x001313B0, 0x0020BC70, 0x001C3FC0, 0x00050606},
 	[BYOND_VERSION_ADJUSTED(1622)] = {0x0040755C, 0x00407560, 0x0040756C, 0x0040757C,       0x28, 0x001312D0, 0x0020BB90, 0x001C3EB0, 0x00050606},
 	[BYOND_VERSION_ADJUSTED(1623)] = {0x0040755C, 0x00407560, 0x0040756C, 0x0040757C,       0x28, 0x001312D0, 0x0020BB90, 0x001C3EB0, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1630)] = {0x0040556C, 0x00405570, 0x0040557C, 0x0040558C,				0x2C, 0x0012F710, 0x0020A2E0, 0x001C2430, 0x00050606},
 };
 
 #elif defined(UTRACY_LINUX)
-#	define BYOND_MAX_BUILD 1623
+#	define BYOND_MAX_BUILD 1630
 #	define BYOND_MIN_BUILD 1543
+# define BYOND_LEGACY_MAX 1623
 #	define BYOND_VERSION_ADJUSTED(a) ((a) - BYOND_MIN_BUILD)
 
 static int unsigned const byond_offsets[][9] = {
@@ -1178,6 +1196,7 @@ static int unsigned const byond_offsets[][9] = {
 	[BYOND_VERSION_ADJUSTED(1621)] = {0x006D8698, 0x006D869C, 0x006D86B0, 0x006D86EC,       0x28, 0x003252F0, 0x003121F0, 0x00309E30, 0x00050505},
 	[BYOND_VERSION_ADJUSTED(1622)] = {0x006D71B8, 0x006D71BC, 0x006D71D0, 0x006D720C,       0x28, 0x00324BC0, 0x00311AC0, 0x00309700, 0x00050505},
 	[BYOND_VERSION_ADJUSTED(1623)] = {0x006D71B8, 0x006D71BC, 0x006D71D0, 0x006D720C,       0x28, 0x00324BD0, 0x00311AD0, 0x00309710, 0x00050505},
+	[BYOND_VERSION_ADJUSTED(1630)] = {0x006D47B8, 0x006D47BC, 0x006D47D0, 0x006D480C, 			0x2C, 0x003213E0, 0x0030E240, 0x00305E80, 0x00050505},
 };
 
 #endif
@@ -1188,6 +1207,7 @@ void build_srclocs(void) {
 #define byond_get_misc(id) (id < *byond.miscs_len ? *(*byond.miscs + id) : NULL)
 #define byond_get_procdef(id) (void *)((id < *byond.procdefs_len ? ((char *)(*byond.procdefs)) + id * byond.procdef_size : NULL))
 
+	int legacy_mode = (byond_build <= BYOND_LEGACY_MAX);
 	for(int unsigned i=0; i<0x14000; i++) {
 		char const *name = NULL;
 		char const *function = "<?>";
@@ -1195,14 +1215,18 @@ void build_srclocs(void) {
 		int unsigned line = 0xFFFFFFFFu;
 		int unsigned color = 0x4444AF;
 
-		struct procdef const *const procdef = byond_get_procdef(i);
-		if(procdef != NULL) {
-			struct string const *const str = byond_get_string(procdef->path);
+		void* procdef_ptr = byond_get_procdef(i);
+
+		struct procdef const *const procdef = procdef_ptr;
+		struct procdef_legacy const *const procdef_legacy = procdef_ptr;
+
+		if(procdef_ptr != NULL) {
+			struct string const *const str = legacy_mode ? byond_get_string(procdef_legacy->path) : byond_get_string(procdef->path);
 			if(str != NULL && str->data != NULL) {
 				function = str->data;
 			}
 
-			struct misc const *const misc = byond_get_misc(procdef->bytecode);
+			struct misc const *const misc = legacy_mode ? byond_get_misc(procdef_legacy->bytecode) : byond_get_misc(procdef->bytecode);
 			if(misc != NULL) {
 				int unsigned bytecode_len = misc->bytecode.len;
 				int unsigned *bytecode = misc->bytecode.bytecode;
@@ -1310,7 +1334,7 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 #endif
 
-	int byond_build = GetByondBuild();
+	byond_build = GetByondBuild();
 	if(byond_build < BYOND_MIN_BUILD || byond_build > BYOND_MAX_BUILD) {
 		LOG_DEBUG_ERROR;
 		return "byond version unsupported";
