@@ -4,17 +4,25 @@ Para-byond-tracy glues together a byond server the tracy profiler allowing you t
 
 Note that the files generated cannot be loaded straight into tracy. You must use `replay.py` to load the `.utracy` file and stream "it over the network" (localhost) into `capture.exe` as part of Tracy. You can stream straight into `Tracy.exe`, but this is not advised due to performance overhead.
 
-Update 2023-12-29: You can now use [https://github.com/AffectedArc07/ParaTracyReplay](https://github.com/AffectedArc07/ParaTracyReplay) to stream the files much faster than the python script.
+> The above script requires the `lz4` library with the stream addon. 
+> ```bash
+> PYLZ4_EXPERIMENTAL=TRUE python3 -m pip install --no-cache-dir --no-binary lz4 lz4
+> ```
 
-The above script requires the `lz4` library with the stream addon. The instructions for that are out of scope of this guide.
+> **Update 2023-12-29**: You can now use [https://github.com/AffectedArc07/ParaTracyReplay](https://github.com/AffectedArc07/ParaTracyReplay) to stream the files much faster than the python script. If something goes wrong, revert back to the python script and compare results.
 
 A massive thanks to `mafemergency` for even making this possible. The below readme is adapted from the original repo (branch: `stream-to-file`) [https://github.com/mafemergency/byond-tracy/](https://github.com/mafemergency/byond-tracy/)
 
-## supported byond versions
+## Supported byond versions
 
 | windows  | linux    |
 | -------- | -------- |
-| 515.1623 |          |
+| 515.1630 | 515.1630 |
+| 515.1623 | 515.1623 |
+| 515.1622 | 515.1622 |
+| 515.1621 | 515.1621 |
+| 515.1620 | 515.1620 |
+| 515.1619 | 515.1619 |
 | 515.1618 | 515.1618 |
 | 515.1617 | 515.1617 |
 | 515.1616 | 515.1616 |
@@ -46,37 +54,103 @@ A massive thanks to `mafemergency` for even making this possible. The below read
 | 515.1590 | 515.1590 |
 | 514.*    | 514.*    |
 
-## supported tracy versions
+## Supported tracy versions
 
 `0.8.1` `0.8.2`
 
-## usage
+## Usage
 
 simply call `init` from `prof.dll` to begin collecting profile data and connect using [tracy-server](https://github.com/wolfpld/tracy/releases) `Tracy.exe`
 
 ```dm
+// Implements https://github.com/mafemergency/byond-tracy
+// Client https://github.com/wolfpld/tracy
+// As of now, only 0.8.2 is supported as a client, this might change in the future however
+
+// In case you need to start the capture as soon as the server boots, uncomment the following lines and recompile:
+
+// /world/New()
+// 	prof_init()
+// 	. = ..()
+
+#ifndef PROF
+// Default automatic PROF detection.
+// On Windows, looks in the standard places for `prof.dll`.
+// On Linux, looks in `.`, `$LD_LIBRARY_PATH`, and `~/.byond/bin` for either of
+// `libprof.so` (preferred) or `prof` (old).
+
+/* This comment bypasses grep checks */ /var/__prof
+
+/proc/__detect_prof()
+	if (world.system_type == UNIX)
+		if (fexists("./libprof.so"))
+			// No need for LD_LIBRARY_PATH badness.
+			return __prof = "./libprof.so"
+		else if (fexists("./prof"))
+			// Old dumb filename.
+			return __prof = "./prof"
+		else if (fexists("[world.GetConfig("env", "HOME")]/.byond/bin/prof"))
+			// Old dumb filename in `~/.byond/bin`.
+			return __prof = "prof"
+		else
+			// It's not in the current directory, so try others
+			return __prof = "libprof.so"
+	else
+		return __prof = "prof"
+
+#define PROF (__prof || __detect_prof())
+#endif
+
+// Handle 515 call() -> call_ext() changes
+#if DM_VERSION >= 515
+#define PROF_CALL call_ext
+#else
+#define PROF_CALL call
+#endif
+
+GLOBAL_VAR_INIT(profiler_enabled, FALSE)
+
+/**
+ * Starts Tracy
+ */
 /proc/prof_init()
-    var/lib
+	var/init = PROF_CALL(PROF, "init")()
+	if("0" != init) CRASH("[PROF] init error: [init]")
+	GLOB.profiler_enabled = TRUE
 
-    switch(world.system_type)
-        if(MS_WINDOWS) lib = "prof.dll"
-        if(UNIX) lib = "libprof.so"
-        else CRASH("unsupported platform")
+/**
+ * Stops Tracy
+ */
+/proc/prof_stop()
+	if(!GLOB.profiler_enabled)
+		return
 
-    var/init = call_ext(lib, "init")()
-    if("0" != init) CRASH("[lib] init error: [init]")
+	var/destroy = PROF_CALL(PROF, "destroy")()
+	if("0" != destroy) CRASH("[PROF] destroy error: [destroy]")
+	GLOB.profiler_enabled = FALSE
 
 /world/New()
     prof_init()
     . = ..()
+
+/world/Del()
+    prof_stop()
+    . = ..()
 ```
 
-## building
+## Building
 
-no build system included, simply invoke your preferred c11 compiler.
+cmake build system included, or simply invoke your preferred c11 compiler.
 examples:
 
-(AA recommended: If you have the MSVC++ buildchain, open `x86 Native Tools Command Prompt for VS 2022` and then cd to this repo. `cl` should be on your path inside of that CLI environment)
+> AA recommended: If you have the MSVC++ buildchain, open `x86 Native Tools Command Prompt for VS 2022` and then cd to this repo. `cl` should be on your path inside of that CLI environment
+
+> azizonkg recommended: use cmake on linux
+
+```console
+cmake --build . --config Release
+```
+
 
 ```console
 cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll
@@ -90,6 +164,6 @@ clang.exe -std=c11 -m32 -shared -Ofast3 -DNDEBUG -fuse-ld=lld-link prof.c -lws2_
 gcc -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
 ```
 
-## remarks
+## Remarks
 
 byond-tracy is in its infancy and is not production ready for live servers.
