@@ -2,3 +2,8 @@ prof.dll
 prof.exp
 prof.lib
 prof.obj
+libprof.so
+CMakeFiles
+CMakeCache.txt
+cmake_install.cmake
+Makefile
