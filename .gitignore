@@ -1,4 +1,3 @@
-prof.dll
-prof.exp
-prof.lib
-prof.obj
+prof.*
+!prof.c
+/.vs
