@@ -1472,7 +1472,8 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 #define MAX_PATH 260 // same as windows
 #endif
 
-	char ffilename[MAX_PATH];
+	static char ffilename[MAX_PATH];
+	*ffilename = 0;
 	snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy", utracy_tsc());
 	utracy.fstream = fopen(ffilename, "wb");
 	if(NULL == utracy.fstream) {
@@ -1504,7 +1505,7 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 #endif
 
 	initialized = 1;
-	return "0";
+	return ffilename;
 }
 
 UTRACY_EXTERNAL
