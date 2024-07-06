@@ -72,7 +72,10 @@ None built in, you need to reply these.
 
 simply call `init` from `prof.dll` to begin writing to a file inside `data/profiler`
 
+init will return the filename it writes to upon success - the filename will always start with `.`
+
 ```dm
+// returns a string filename whenever
 /proc/prof_init()
     var/lib
 
@@ -82,10 +85,13 @@ simply call `init` from `prof.dll` to begin writing to a file inside `data/profi
         else CRASH("unsupported platform")
 
     var/init = call_ext(lib, "init")()
-    if("0" != init) CRASH("[lib] init error: [init]")
+    if(length(init) != 0 && init[1] == ".") // if first character is ., then it returned the output filename
+        return init
+    else if("0" != init)
+        CRASH("[lib] init error: [init]")
 
 /world/New()
-    prof_init()
+    var/utracy_filename = prof_init()
     . = ..()
 ```
 
