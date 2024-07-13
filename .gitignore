@@ -1,3 +1,9 @@
 prof.*
 !prof.c
 /.vs
+
+libprof.so
+CMakeFiles
+CMakeCache.txt
+cmake_install.cmake
+Makefile

@@ -4,15 +4,18 @@ Para-byond-tracy glues together a byond server the tracy profiler allowing you t
 
 Note that the files generated cannot be loaded straight into tracy. You must use `replay.py` to load the `.utracy` file and stream "it over the network" (localhost) into `capture.exe` as part of Tracy. You can stream straight into `Tracy.exe`, but this is not advised due to performance overhead.
 
-The above script requires the `lz4` library with the stream addon. The instructions for that are out of scope of this guide.
+> The above script requires the `lz4` library with the stream addon. 
+> ```bash
+> PYLZ4_EXPERIMENTAL=TRUE python3 -m pip install --no-cache-dir --no-binary lz4 lz4
+> ```
 
-Update 2023-12-29: You can now use [https://github.com/AffectedArc07/ParaTracyReplay](https://github.com/AffectedArc07/ParaTracyReplay) to stream the files much faster than the python script.
+> **Update 2023-12-29**: You can now use [https://github.com/AffectedArc07/ParaTracyReplay](https://github.com/AffectedArc07/ParaTracyReplay) to stream the files much faster than the python script.
 
-Update 2024-04-18: You can now use [https://github.com/Dimach/rtracy](https://github.com/Dimach/rtracy) to stream the files even faster than the C# code, as well as split traces and other cool things.
+> **Update 2024-04-18**: You can now use [https://github.com/Dimach/rtracy](https://github.com/Dimach/rtracy) to stream the files even faster than the C# code, as well as split traces and other cool things.
 
 A massive thanks to `mafemergency` for even making this possible. The below readme is adapted from the original repo (branch: `stream-to-file`) [https://github.com/mafemergency/byond-tracy/](https://github.com/mafemergency/byond-tracy/)
 
-## supported byond versions
+## Supported byond versions
 
 | windows  | linux    |
 | -------- | -------- |
@@ -64,11 +67,11 @@ A massive thanks to `mafemergency` for even making this possible. The below read
 | 515.1590 | 515.1590 |
 | 514.*    | 514.*    |
 
-## supported tracy versions
+## Supported tracy versions
 
 None built in, you need to reply these.
 
-## usage
+## Usage
 
 simply call `init` from `prof.dll` to begin writing to a file inside `data/profiler`
 
@@ -95,12 +98,19 @@ init will return the filename it writes to upon success - the filename will alwa
     . = ..()
 ```
 
-## building
+## Building
 
-no build system included, simply invoke your preferred c11 compiler.
+cmake build system included, or simply invoke your preferred c11 compiler.
 examples:
 
-(AA recommended: If you have the MSVC++ buildchain, open `x86 Native Tools Command Prompt for VS 2022` and then cd to this repo. `cl` should be on your path inside of that CLI environment)
+> AA recommended: If you have the MSVC++ buildchain, open `x86 Native Tools Command Prompt for VS 2022` and then cd to this repo. `cl` should be on your path inside of that CLI environment
+
+> azizonkg recommended: use cmake on linux
+
+```console
+cmake --build . --config Release
+```
+
 
 ```console
 cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll
@@ -114,6 +124,6 @@ clang.exe -std=c11 -m32 -shared -Ofast3 -DNDEBUG -fuse-ld=lld-link prof.c -lws2_
 gcc -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
 ```
 
-## remarks
+## Remarks
 
 byond-tracy is in its infancy and is not production ready for live servers.

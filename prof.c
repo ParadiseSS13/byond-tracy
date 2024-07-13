@@ -46,6 +46,7 @@
 #	define likely(expr) (expr)
 #	define unlikely(expr) (expr)
 #endif
+#define UTRACY_ALIGN_DOWN(ptr, size) ((void *) ((uintptr_t) (ptr) & (~((size) - 1))))
 
 /* data type size check */
 _Static_assert(sizeof(void *) == 4, "incorrect size");
@@ -113,6 +114,8 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 #	include <netinet/ip.h>
 #	include <arpa/inet.h>
 #	include <poll.h>
+/* avoid including stdlib.h */
+char *getenv(char const *);
 #endif
 
 #include <stddef.h>
@@ -223,6 +226,9 @@ size_t strlen(char const *const a) {
 #endif
 
 /* config */
+#define UTRACY_L1_LINE_SIZE (64)
+#define UTRACY_PAGE_SIZE (4096)
+
 #define EVENT_QUEUE_CAPACITY (1u << 18u)
 _Static_assert((EVENT_QUEUE_CAPACITY & (EVENT_QUEUE_CAPACITY - 1)) == 0, "EVENT_QUEUE_CAPACITY must be a power of 2");
 
@@ -376,6 +382,11 @@ static struct {
 	int (UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL *orig_server_tick)(void);
 	void *send_maps;
 	void (UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL *orig_send_maps)(void);
+	_Alignas(UTRACY_PAGE_SIZE) struct {
+		char exec_proc[32];
+		char server_tick[32];
+		char send_maps[32];
+	} trampoline;
 } byond;
 
 static struct {
@@ -408,9 +419,9 @@ static struct {
 		long volatile head;
 		long volatile tail;
 #else
-		_Alignas(64) atomic_uint head;
-		_Alignas(64) atomic_uint tail;
-		_Alignas(64) int padding;
+		_Alignas(UTRACY_L1_LINE_SIZE) atomic_uint head;
+		_Alignas(UTRACY_L1_LINE_SIZE) atomic_uint tail;
+		_Alignas(UTRACY_L1_LINE_SIZE) int padding;
 #endif
 	} queue;
 } utracy;
@@ -673,7 +684,7 @@ struct utracy_source_location {
 	int unsigned color;
 };
 
-static struct utracy_source_location srclocs[0x10002];
+static struct utracy_source_location srclocs[0x14002];
 
 UTRACY_INTERNAL UTRACY_INLINE
 void utracy_emit_zone_begin(int unsigned proc) {
@@ -757,7 +768,13 @@ static int utracy_write(void const *const buf, size_t size) {
 }
 #else
 static int utracy_write(void const *const buf, size_t size) {
-	fwrite(buf, 1, size, utracy.fstream);
+	if(size != fwrite(buf, 1, size, utracy.fstream)) {
+		perror("fwrite");
+		fflush(utracy.fstream);
+		fsync(fileno(utracy.fstream));
+		fclose(utracy.fstream);
+		abort();
+	}
 	return 0;
 }
 #endif
@@ -893,7 +910,7 @@ void *utracy_server_thread_start(void *user) {
 /* byond hooks */
 UTRACY_INTERNAL
 struct object UTRACY_WINDOWS_CDECL UTRACY_LINUX_REGPARM(3) exec_proc(struct proc *proc) {
-	if(likely(proc->procdef < 0x10000)) {
+	if(likely(proc->procdef < 0x14000)) {
 		utracy_emit_zone_begin(proc->procdef);
 
 		/* procs with pre-existing contexts are resuming from sleep */
@@ -916,7 +933,7 @@ int UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL server_tick(void) {
 	/* server tick is the end of a frame and the beginning of the next frame */
 	utracy_emit_frame_mark(NULL);
 
-	utracy_emit_zone_begin(0x10000);
+	utracy_emit_zone_begin(0x14000);
 
 	int interval = byond.orig_server_tick();
 
@@ -927,7 +944,7 @@ int UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL server_tick(void) {
 
 UTRACY_INTERNAL
 void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
-	utracy_emit_zone_begin(0x10001);
+	utracy_emit_zone_begin(0x14001);
 
 	byond.orig_send_maps();
 
@@ -936,23 +953,10 @@ void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
 
 /* hooking */
 UTRACY_INTERNAL
-void *hook(char *const restrict dst, char *const restrict src, char unsigned size) {
+void *hook(char *const restrict dst, char *const restrict src, char unsigned size, char *trampoline) {
 	char unsigned jmp[] = {
 		0xE9, 0x00, 0x00, 0x00, 0x00
 	};
-
-#if defined(UTRACY_WINDOWS)
-	char *trampoline = VirtualAlloc(NULL, 4096, MEM_COMMIT, PAGE_READWRITE);
-
-#elif defined(UTRACY_LINUX)
-	long page_size = sysconf(_SC_PAGE_SIZE);
-	char *trampoline = aligned_alloc(page_size, page_size);
-
-#endif
-
-	if(NULL == trampoline) {
-		return NULL;
-	}
 
 	uintptr_t jmp_from = (uintptr_t) trampoline + size + sizeof(jmp);
 	uintptr_t jmp_to = (uintptr_t) src + size;
@@ -961,38 +965,20 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 	(void) UTRACY_MEMCPY(trampoline, src, size);
 	(void) UTRACY_MEMCPY(trampoline + size, jmp, sizeof(jmp));
 
-#if defined(UTRACY_WINDOWS)
-	DWORD old_protect;
-	if(0 == VirtualProtect(trampoline, 4096, PAGE_EXECUTE_READWRITE, &old_protect)) {
-		LOG_DEBUG_ERROR;
-		(void) VirtualFree(trampoline, 0, MEM_RELEASE);
-		return NULL;
-	}
-
-#elif defined(UTRACY_LINUX)
-	if(0 != mprotect(trampoline, page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
-		LOG_DEBUG_ERROR;
-		free(trampoline);
-		return NULL;
-	}
-
-#endif
-
 	jmp_from = (uintptr_t) src + sizeof(jmp);
 	jmp_to = (uintptr_t) dst;
 	offset = jmp_to - jmp_from;
 
 #if defined(UTRACY_WINDOWS)
+	DWORD old_protect;
 	if(0 == VirtualProtect(src, size, PAGE_READWRITE, &old_protect)) {
 		LOG_DEBUG_ERROR;
-		(void) VirtualFree(trampoline, 0, MEM_RELEASE);
 		return NULL;
 	}
 
 #elif defined(UTRACY_LINUX)
-	if(0 != mprotect((void *) ((uintptr_t) src & ((uintptr_t) -page_size)), page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
+	if(0 != mprotect(UTRACY_ALIGN_DOWN(src, UTRACY_PAGE_SIZE), UTRACY_PAGE_SIZE, PROT_WRITE | PROT_READ)) {
 		LOG_DEBUG_ERROR;
-		free(trampoline);
 		return NULL;
 	}
 
@@ -1015,7 +1001,7 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 	}
 
 #elif defined(UTRACY_LINUX)
-	if(0 != mprotect((void *) ((uintptr_t) src & (uintptr_t) -page_size), page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
+	if(0 != mprotect(UTRACY_ALIGN_DOWN(src, UTRACY_PAGE_SIZE), UTRACY_PAGE_SIZE, PROT_READ | PROT_EXEC)) {
 		LOG_DEBUG_ERROR;
 		return NULL;
 	}
@@ -1239,7 +1225,7 @@ void build_srclocs(void) {
 #define byond_get_procdef_path(procdef) *((int unsigned *)((procdef) + byond.procdef_desc.path))
 #define byond_get_procdef_bytecode(procdef) *((int unsigned *)((procdef) + byond.procdef_desc.bytecode))
 
-	for(int unsigned i=0; i<0x10000; i++) {
+	for(int unsigned i=0; i<0x14000; i++) {
 		char *name = NULL;
 		char *function = "<?>";
 		char *file = "<?.dm>";
@@ -1284,7 +1270,7 @@ void build_srclocs(void) {
 		};
 	}
 
-	srclocs[0x10000] = (struct utracy_source_location) {
+	srclocs[0x14000] = (struct utracy_source_location) {
 		.name = NULL,
 		.function = "ServerTick",
 		.file = __FILE__,
@@ -1292,7 +1278,7 @@ void build_srclocs(void) {
 		.color = 0x44AF44
 	};
 
-	srclocs[0x10001] = (struct utracy_source_location) {
+	srclocs[0x14001] = (struct utracy_source_location) {
 		.name = NULL,
 		.function = "SendMaps",
 		.file = __FILE__,
@@ -1420,23 +1406,38 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	LOG_INFO("byond build = %d\n", byond_build);
 
-	byond.orig_exec_proc = hook((void *) exec_proc, byond.exec_proc, prologues[0]);
+	byond.orig_exec_proc = hook((void *) exec_proc, byond.exec_proc, prologues[0], byond.trampoline.exec_proc);
 	if(NULL == byond.orig_exec_proc) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook exec_proc";
 	}
 
-	byond.orig_server_tick = hook((void *) server_tick, byond.server_tick, prologues[1]);
+	byond.orig_server_tick = hook((void *) server_tick, byond.server_tick, prologues[1], byond.trampoline.server_tick);
 	if(NULL == byond.orig_server_tick) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook server_tick";
 	}
 
-	byond.orig_send_maps = hook((void *) send_maps, byond.send_maps, prologues[2]);
+	byond.orig_send_maps = hook((void *) send_maps, byond.send_maps, prologues[2], byond.trampoline.send_maps);
 	if(NULL == byond.orig_send_maps) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook send_maps";
 	}
+
+#if defined(UTRACY_WINDOWS)
+	DWORD old_protect;
+	if(0 == VirtualProtect(&byond.trampoline, UTRACY_PAGE_SIZE, PAGE_EXECUTE_READ, &old_protect)) {
+		LOG_DEBUG_ERROR;
+		return "failed to set trampoline access protection";
+	}
+
+#elif defined(UTRACY_LINUX)
+	if(0 != mprotect(&byond.trampoline, UTRACY_PAGE_SIZE, PROT_READ | PROT_EXEC)) {
+		LOG_DEBUG_ERROR;
+		return "failed to set trampoline access protection";
+	}
+
+#endif
 
 	build_srclocs();
 
@@ -1491,6 +1492,8 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 #if defined(UTRACY_WINDOWS)
 	if(NULL == (utracy.thread = CreateThread(NULL, 0, utracy_server_thread_start, NULL, 0, NULL))) {
 		LOG_DEBUG_ERROR;
+		fflush(utracy.fstream);
+		fsync(fileno(utracy.fstream));
 		fclose(utracy.fstream);
 		return "CreateThread failed";
 	}
@@ -1499,6 +1502,9 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	utracy.quit = 0;
 	if (0 != pthread_create(&utracy.thread, NULL, utracy_server_thread_start, NULL)) {
 		LOG_DEBUG_ERROR;
+		fflush(utracy.fstream);
+		fsync(fileno(utracy.fstream));
+		fclose(utracy.fstream);
 		return "pthread_create failed";
 	}
 
@@ -1533,13 +1539,16 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 	pthread_join(utracy.thread, &thread_return);
 #endif
 
+	fflush(utracy.fstream);
+	fsync(fileno(utracy.fstream));
 	fclose(utracy.fstream);
+	
 	initialized = 0;
 
 	return "0";
 }
 
-#if (__STDC_HOSTED__ == 0)
+#if (__STDC_HOSTED__ == 0) && defined(UTRACY_WINDOWS)
 BOOL WINAPI DllMainCRTStartup(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 	return TRUE;
 }
