@@ -660,10 +660,8 @@ long long unix_timestamp(void) {
 
 #define UTRACY_EVT_ZONEBEGIN (15)
 #define UTRACY_EVT_ZONEEND (17)
-#define UTRACY_EVT_PLOTDATA (43)
-#define UTRACY_EVT_THREADCONTEXT (57)
-#define UTRACY_EVT_ZONECOLOR (62)
-#define UTRACY_EVT_FRAMEMARKMSG (64)
+#define UTRACY_EVT_ZONECOLOR (65)
+#define UTRACY_EVT_FRAMEMARKMSG (67)
 
 struct utracy_source_location {
 	char const *name;
@@ -797,7 +795,7 @@ void *utracy_server_thread_start(void *user) {
 		_Static_assert(sizeof(struct event) == 24, "event size changed!");
 
 		header.signature = 0x6D64796361727475llu;
-		header.version = 2;
+		header.version = 3;
 		header.multiplier = utracy.info.multiplier;
 		header.init_begin = utracy.info.init_begin;
 		header.init_end = utracy.info.init_end;
