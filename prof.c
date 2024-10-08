@@ -10,6 +10,7 @@
 /* platform identification */
 #if defined(_WIN32)
 #	define UTRACY_WINDOWS
+#	define _CRT_SECURE_NO_WARNINGS
 #	if defined(_WIN64)
 #		error 64 bit not supported
 #	endif
@@ -106,6 +107,7 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 #	include <sys/socket.h>
 #	include <sys/mman.h>
 #	include <sys/stat.h>
+#	include <sys/eventfd.h>
 #	include <netdb.h>
 #	include <pthread.h>
 #	include <dlfcn.h>
@@ -113,11 +115,13 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 #	include <netinet/ip.h>
 #	include <arpa/inet.h>
 #	include <poll.h>
+#	include <fcntl.h>
 #endif
 
 #include <stddef.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #if (__STDC_HOSTED__ == 1)
 #	include <stdlib.h>
@@ -314,6 +318,12 @@ _Static_assert(sizeof(struct proc) >= 4, "incorrect size");
 #	define atomic_store_release(a, b) atomic_store_explicit((a), (b), memory_order_release)
 #endif
 
+#if defined(UTRACY_WINDOWS)
+typedef HANDLE event_pipe_t;
+#elif defined(UTRACY_LINUX)
+typedef int event_pipe_t;
+#endif
+
 struct event_zone_begin {
 	int unsigned tid;
 	int unsigned srcloc;
@@ -391,11 +401,10 @@ static struct {
 
 #if defined(UTRACY_WINDOWS)
 	HANDLE thread;
-	HANDLE quit;
 #elif defined(UTRACY_LINUX)
 	pthread_t thread;
-	volatile int quit;
 #endif
+	event_pipe_t quit;
 
 	FILE* fstream;
 
@@ -414,6 +423,75 @@ static struct {
 #endif
 	} queue;
 } utracy;
+
+#if defined(UTRACY_WINDOWS)
+UTRACY_INTERNAL
+event_pipe_t create_event_pipe(bool manual_reset, int initial_state, const char* name) {
+	return CreateEvent(NULL, manual_reset, initial_state, name ? TEXT(name) : NULL);
+}
+
+UTRACY_INTERNAL
+void close_event_pipe(event_pipe_t event_pipe) {
+	CloseHandle(event_pipe);
+}
+
+UTRACY_INTERNAL
+int wait_for_event_pipe(event_pipe_t event_pipe, int timeout_ms) {
+	DWORD result = WaitForSingleObject(event_pipe, timeout_ms);
+	switch (result) {
+		case WAIT_OBJECT_0: return 0;
+		case WAIT_TIMEOUT: return 1;
+		default: return -1;
+	}
+}
+
+UTRACY_INTERNAL
+void set_event_pipe(event_pipe_t event_pipe) {
+	SetEvent(event_pipe);
+}
+#elif defined(UTRACY_LINUX)
+UTRACY_INTERNAL
+event_pipe_t create_event_pipe(bool manual_reset, int initial_state, const char* name) {
+	(void)manual_reset; // Unused on Linux
+	(void)name; // Unused on Linux
+	return eventfd(initial_state ? 1 : 0, EFD_CLOEXEC);
+}
+
+UTRACY_INTERNAL
+void close_event_pipe(event_pipe_t event_pipe) {
+	close(event_pipe);
+}
+
+UTRACY_INTERNAL
+int wait_for_event_pipe(event_pipe_t event_pipe, int timeout_ms) {
+	fd_set fds;
+	struct timeval tv;
+	uint64_t value;
+
+	FD_ZERO(&fds);
+	FD_SET(event_pipe, &fds);
+
+	tv.tv_sec = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+	int result = select(event_pipe + 1, &fds, NULL, NULL, timeout_ms >= 0 ? &tv : NULL);
+	if (result > 0) {
+		if (read(event_pipe, &value, sizeof(value)) == sizeof(value)) {
+			return 0;
+		}
+	} else if (result == 0) {
+		return 1; // Timeout
+	}
+	return -1; // Error
+}
+
+UTRACY_INTERNAL
+void set_event_pipe(event_pipe_t event_pipe) {
+	uint64_t value = 1;
+	(void) write(event_pipe, &value, sizeof(value));
+}
+#endif
+
 
 /* queue api */
 UTRACY_INTERNAL UTRACY_INLINE
@@ -764,11 +842,15 @@ static int utracy_write(void const *const buf, size_t size) {
 
 UTRACY_INTERNAL
 #if defined(UTRACY_WINDOWS)
-DWORD WINAPI utracy_server_thread_start(PVOID user) {
+DWORD WINAPI utracy_server_thread_start(void* arg) {
 #elif defined(UTRACY_LINUX)
-void *utracy_server_thread_start(void *user) {
+void *utracy_server_thread_start(void* arg) {
 #endif
-	(void) user;
+	event_pipe_t profiler_connected_event = (event_pipe_t)arg;
+	
+	if (profiler_connected_event) {
+		set_event_pipe(profiler_connected_event);
+	}
 
 	{
 		struct {
@@ -853,30 +935,22 @@ void *utracy_server_thread_start(void *user) {
 		(void) utracy_write(&srcloc.color, sizeof(srcloc.color));
 	}
 
-	int quitting = 0;
+	bool quitting = false;
 	while(!quitting) {
 		struct event evt;
 		while(0 == event_queue_pop(&evt)) {
 			(void) utracy_write(&evt, sizeof(evt));
 		}
-
-#if defined(UTRACY_WINDOWS)
-		switch (WaitForSingleObject(utracy.quit, 1)) {
-		default:
-			LOG_DEBUG_ERROR;
-		case WAIT_OBJECT_0:
-			quitting = 1;
-			break;
-		case WAIT_TIMEOUT:
-			break;
+		switch (wait_for_event_pipe(utracy.quit, 1)) {
+			case 0:
+				quitting = true;
+				break;
+			case 1:
+				break;
+			default:
+				LOG_DEBUG_ERROR;
+				break;
 		}
-#elif defined(UTRACY_LINUX)
-		if (utracy.quit) {
-			break;
-		}
-
-		usleep(1000);
-#endif
 	}
 
 
@@ -886,6 +960,7 @@ void *utracy_server_thread_start(void *user) {
 
 	ExitThread(0);
 #elif defined(UTRACY_LINUX)
+	close(utracy.quit);
 	pthread_exit(NULL);
 #endif
 }
@@ -1318,7 +1393,7 @@ void build_srclocs(void) {
 }
 
 /* byond api */
-static int initialized = 0;
+static bool initialized = false;
 
 UTRACY_EXTERNAL
 char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
@@ -1327,8 +1402,13 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	printf("hello world?\n");
 
-	if(0 != initialized) {
+	if(initialized) {
 		return "already initialized";
+	}
+
+	bool block_start = false;
+	if (argc > 0 && strcmp(argv[0], "block") == 0) {
+		block_start = true;
 	}
 
 	(void) UTRACY_MEMSET(&byond, 0, sizeof(byond));
@@ -1450,6 +1530,12 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	build_srclocs();
 
+	utracy.quit = create_event_pipe(true, 0, NULL);
+	if (utracy.quit == 0) {
+		LOG_DEBUG_ERROR;
+		return "create_event_pipe(utracy.quit) failed";
+	}
+
 #if defined(UTRACY_LINUX)
 	linux_main_tid = syscall(__NR_gettid);
 
@@ -1468,12 +1554,6 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 		}
 	}
 #elif defined(UTRACY_WINDOWS)
-	utracy.quit = CreateEventA(NULL, TRUE, FALSE, NULL);
-	if(NULL == utracy.quit) {
-		LOG_DEBUG_ERROR;
-		return "CreateEventA failed";
-	}
-
 	(void) CreateDirectoryW(L".\\data", NULL);
 	(void) CreateDirectoryW(L".\\data\\profiler", NULL);
 #endif
@@ -1482,8 +1562,17 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 #define MAX_PATH 260 // same as windows
 #endif
 
+	event_pipe_t profiler_connected_event = 0;
+	if (block_start) {
+		profiler_connected_event = create_event_pipe(true, 0, "ProfilerConnectedEvent");
+		if (profiler_connected_event == 0) {
+			LOG_DEBUG_ERROR;
+			return "create_event_pipe(profiler_connected_event) failed";
+		}
+	}
+
 	static char ffilename[MAX_PATH];
-	*ffilename = 0;
+	memset(ffilename, 0, MAX_PATH);
 	snprintf(ffilename, MAX_PATH, "./data/profiler/%llu.utracy", utracy_tsc());
 	utracy.fstream = fopen(ffilename, "wb");
 	if(NULL == utracy.fstream) {
@@ -1499,22 +1588,27 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	utracy.info.init_end = utracy_tsc();
 
 #if defined(UTRACY_WINDOWS)
-	if(NULL == (utracy.thread = CreateThread(NULL, 0, utracy_server_thread_start, NULL, 0, NULL))) {
+	if(NULL == (utracy.thread = CreateThread(NULL, 0, utracy_server_thread_start, (void*)profiler_connected_event, 0, NULL))) {
 		LOG_DEBUG_ERROR;
 		fclose(utracy.fstream);
 		return "CreateThread failed";
 	}
-
 #elif defined(UTRACY_LINUX)
-	utracy.quit = 0;
-	if (0 != pthread_create(&utracy.thread, NULL, utracy_server_thread_start, NULL)) {
+	if (0 != pthread_create(&utracy.thread, NULL, utracy_server_thread_start, (void*)profiler_connected_event)) {
 		LOG_DEBUG_ERROR;
 		return "pthread_create failed";
 	}
-
 #endif
 
-	initialized = 1;
+	initialized = true;
+
+	if (block_start) {
+		printf("blocking until initialized\n");
+		wait_for_event_pipe(profiler_connected_event, -1);
+		printf("initialized, unblocking\n");
+		close_event_pipe(profiler_connected_event);
+	}
+
 	return ffilename;
 }
 
@@ -1524,13 +1618,12 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 	(void) argv;
 
 	/* not yet implemented */
-	if(1 != initialized) {
+	if(!initialized) {
 		return "not initialized";
 	}
 
+	set_event_pipe(utracy.quit);
 #if defined(UTRACY_WINDOWS)
-	(void) SetEvent(utracy.quit);
-
 	switch(WaitForSingleObject(utracy.thread, INFINITE)) {
 		case WAIT_OBJECT_0:
 			break;
@@ -1538,13 +1631,32 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 			LOG_DEBUG_ERROR;
 	}
 #elif defined(UTRACY_LINUX)
-	utracy.quit = 1;
 	void* thread_return;
 	pthread_join(utracy.thread, &thread_return);
 #endif
+	close_event_pipe(utracy.quit);
 
 	fclose(utracy.fstream);
-	initialized = 0;
+	initialized = false;
+
+	return "0";
+}
+
+UTRACY_EXTERNAL
+char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
+	(void) argc;
+	(void) argv;
+
+	if(!initialized) {
+		return "not initialized";
+	} else if(utracy.fstream == NULL) {
+		return "file stream closed";
+	}
+
+	if(fflush(utracy.fstream) != 0) {
+		LOG_DEBUG_ERROR;
+		return "failed to flush file stream";
+	}
 
 	return "0";
 }

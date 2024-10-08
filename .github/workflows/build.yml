@@ -1,0 +1,38 @@
+name: Build
+on: [push, pull_request]
+jobs:
+  windows:
+    name: Windows Build
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up x86 build tools
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86
+        vsversion: 2022
+    - name: Compile byond-tracy
+      run: |
+        cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: byond-tracy-windows
+        path: prof.dll
+  linux:
+    name: Linux Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install gcc-multilib
+      run: |
+        sudo apt-get update
+        sudo apt-get -y install gcc-multilib
+    - name: Compile byond-tracy
+      run: |
+        gcc -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: byond-tracy-linux
+        path: libprof.so
