@@ -13,7 +13,7 @@ jobs:
         vsversion: 2022
     - name: Compile byond-tracy
       run: |
-        cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll
+        cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll /experimental:c11atomics
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
