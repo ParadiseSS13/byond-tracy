@@ -30,7 +30,7 @@ jobs:
         sudo apt-get -y install gcc-multilib
     - name: Compile byond-tracy
       run: |
-        gcc -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
+        gcc -D_FILE_OFFSET_BITS=64 -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
