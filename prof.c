@@ -319,17 +319,10 @@ _Static_assert(sizeof(struct misc) == 36, "incorrect size");
 _Static_assert(sizeof(struct proc) >= 4, "incorrect size");
 
 /* queue */
-#if defined(__STDC_NO_ATOMICS__)
-#	define atomic_load_relaxed(a) *(a)
-#	define atomic_load_acquire(a) *(a)
-#	define atomic_store_seqcst(a, b) *(a) = (b)
-#	define atomic_store_release(a, b) *(a) = (b)
-#else
-#	define atomic_load_relaxed(a) atomic_load_explicit((a), memory_order_relaxed)
-#	define atomic_load_acquire(a) atomic_load_explicit((a), memory_order_acquire)
-#	define atomic_store_seqcst(a, b) atomic_store_explicit((a), (b), memory_order_seq_cst)
-#	define atomic_store_release(a, b) atomic_store_explicit((a), (b), memory_order_release)
-#endif
+#define atomic_load_relaxed(a) atomic_load_explicit((a), memory_order_relaxed)
+#define atomic_load_acquire(a) atomic_load_explicit((a), memory_order_acquire)
+#define atomic_store_seqcst(a, b) atomic_store_explicit((a), (b), memory_order_seq_cst)
+#define atomic_store_release(a, b) atomic_store_explicit((a), (b), memory_order_release)
 
 // Event pipe structure using C11 primitives
 typedef struct event_pipe {
