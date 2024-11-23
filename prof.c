@@ -865,15 +865,20 @@ int utracy_write(void const *const buf, size_t size) {
 #else
 UTRACY_INTERNAL
 int utracy_write(void const *const buf, size_t size) {
-	fwrite(buf, 1, size, utracy.fstream);
+	if(utracy.fstream != NULL) fwrite(buf, 1, size, utracy.fstream);
 	return 0;
 }
 #endif
 
 UTRACY_INTERNAL
-void utracy_flush() {
-	if(utracy.fstream == NULL) return;
-	int fd = _fileno(utracy.fstream);
+void utracy_flush(FILE* stream) {
+	if(stream == NULL) {
+		if(utracy.fstream == NULL) {
+			return;
+		}
+		stream = utracy.fstream;
+	}
+	int fd = _fileno(stream);
 	if(fd == -1) return;
 #if defined(UTRACY_WINDOWS)
 	_commit(fd);
@@ -991,7 +996,7 @@ int utracy_server_thread_start(void* arg) {
 		}
 	}
 
-	utracy_flush();
+	utracy_flush(NULL);
 	close_event_pipe(utracy.quit);
 	utracy.quit = NULL;
 	return 0;
@@ -1654,9 +1659,10 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 
     close_event_pipe(utracy.quit);
 	utracy.quit = NULL;
-	utracy_flush();
-    fclose(utracy.fstream);
+	FILE* fstream = utracy.fstream;
 	utracy.fstream = NULL;
+	utracy_flush(fstream);
+    fclose(fstream);
     initialized = false;
 
     return "0";
