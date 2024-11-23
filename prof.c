@@ -993,6 +993,7 @@ int utracy_server_thread_start(void* arg) {
 
 	utracy_flush();
 	close_event_pipe(utracy.quit);
+	utracy.quit = NULL;
 	return 0;
 }
 
@@ -1637,7 +1638,11 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 
 	if (!initialized) {
         return "not initialized";
-    }
+    } else if (utracy.fstream == NULL) {
+		return "file stream closed";
+	} else if (utracy.quit == NULL) {
+		return "already shutting down";
+	}
 
     set_event_pipe(utracy.quit);
     
@@ -1648,8 +1653,10 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
     }
 
     close_event_pipe(utracy.quit);
+	utracy.quit = NULL;
 	utracy_flush();
     fclose(utracy.fstream);
+	utracy.fstream = NULL;
     initialized = false;
 
     return "0";
@@ -1664,6 +1671,8 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
 		return "not initialized";
 	} else if(utracy.fstream == NULL) {
 		return "file stream closed";
+	} else if (utracy.quit == NULL) {
+		return "already shutting down";
 	}
 
 	// Then ensure it's written to disk
