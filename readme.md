@@ -16,6 +16,9 @@ A massive thanks to `mafemergency` for even making this possible. The below read
 
 | windows  | linux    |
 | -------- | -------- |
+| 515.1646 |          |
+| 515.1645 |          |
+| 515.1644 |          |
 | 515.1643 | 515.1643 |
 | 515.1642 | 515.1642 |
 | 515.1641 |          |
@@ -108,9 +111,10 @@ no build system included, simply invoke your preferred c11 compiler.
 examples:
 
 (AA recommended: If you have the MSVC++ buildchain, open `x86 Native Tools Command Prompt for VS 2022` and then cd to this repo. `cl` should be on your path inside of that CLI environment)
+(Absolucy recommended: just use clang on windows, tbh)
 
 ```console
-cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll
+cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll /experimental:c11atomics
 ```
 
 ```console
@@ -118,7 +122,7 @@ clang.exe -std=c11 -m32 -shared -Ofast3 -DNDEBUG -fuse-ld=lld-link prof.c -lws2_
 ```
 
 ```console
-gcc -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
+gcc -D_FILE_OFFSET_BITS=64 -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
 ```
 
 ## remarks

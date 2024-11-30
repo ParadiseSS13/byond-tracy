@@ -7,6 +7,10 @@
 #	pragma message("compiling as c++ is ill-advised")
 #endif
 
+#if defined(__STDC_NO_ATOMICS__)
+#	error C11 atomics support required (if compiling on windows with MSVC, pass /experimental:c11atomics to cl.exe)
+#endif
+
 /* platform identification */
 #if defined(_WIN32)
 #	define UTRACY_WINDOWS
@@ -47,6 +51,7 @@
 #	define likely(expr) (expr)
 #	define unlikely(expr) (expr)
 #endif
+#define UTRACY_ALIGN_DOWN(ptr, size) ((void *) ((uintptr_t) (ptr) & (~((size) - 1))))
 
 /* data type size check */
 _Static_assert(sizeof(void *) == 4, "incorrect size");
@@ -97,6 +102,7 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 #	include <winsock2.h>
 #	include <ws2tcpip.h>
 #	include <windows.h>
+#   include <io.h>
 #elif defined(UTRACY_LINUX)
 #	define _GNU_SOURCE
 #	include <errno.h>
@@ -116,20 +122,20 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 #	include <arpa/inet.h>
 #	include <poll.h>
 #	include <fcntl.h>
+/* avoid including stdlib.h */
+char *getenv(char const *);
 #endif
 
 #include <stddef.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <threads.h>
+#include <stdatomic.h>
 
 #if (__STDC_HOSTED__ == 1)
 #	include <stdlib.h>
 #	include <string.h>
-#endif
-
-#if !defined(__STDC_NO_ATOMICS__)
-#	include <stdatomic.h>
 #endif
 
 #if (__STDC_HOSTED__ == 0)
@@ -215,6 +221,10 @@ size_t strlen(char const *const a) {
 #	define UTRACY_MEMCMP memcmp
 #endif
 
+#if defined(UTRACY_LINUX)
+#	define _fileno fileno
+#endif
+
 
 /* debugging */
 #if defined(UTRACY_DEBUG) || defined(DEBUG)
@@ -227,6 +237,9 @@ size_t strlen(char const *const a) {
 #endif
 
 /* config */
+#define UTRACY_L1_LINE_SIZE (64)
+#define UTRACY_PAGE_SIZE (4096)
+
 #define EVENT_QUEUE_CAPACITY (1u << 18u)
 _Static_assert((EVENT_QUEUE_CAPACITY & (EVENT_QUEUE_CAPACITY - 1)) == 0, "EVENT_QUEUE_CAPACITY must be a power of 2");
 
@@ -306,23 +319,18 @@ _Static_assert(sizeof(struct misc) == 36, "incorrect size");
 _Static_assert(sizeof(struct proc) >= 4, "incorrect size");
 
 /* queue */
-#if defined(__STDC_NO_ATOMICS__)
-#	define atomic_load_relaxed(a) *(a)
-#	define atomic_load_acquire(a) *(a)
-#	define atomic_store_seqcst(a, b) *(a) = (b)
-#	define atomic_store_release(a, b) *(a) = (b)
-#else
-#	define atomic_load_relaxed(a) atomic_load_explicit((a), memory_order_relaxed)
-#	define atomic_load_acquire(a) atomic_load_explicit((a), memory_order_acquire)
-#	define atomic_store_seqcst(a, b) atomic_store_explicit((a), (b), memory_order_seq_cst)
-#	define atomic_store_release(a, b) atomic_store_explicit((a), (b), memory_order_release)
-#endif
+#define atomic_load_relaxed(a) atomic_load_explicit((a), memory_order_relaxed)
+#define atomic_load_acquire(a) atomic_load_explicit((a), memory_order_acquire)
+#define atomic_store_seqcst(a, b) atomic_store_explicit((a), (b), memory_order_seq_cst)
+#define atomic_store_release(a, b) atomic_store_explicit((a), (b), memory_order_release)
 
-#if defined(UTRACY_WINDOWS)
-typedef HANDLE event_pipe_t;
-#elif defined(UTRACY_LINUX)
-typedef int event_pipe_t;
-#endif
+// Event pipe structure using C11 primitives
+typedef struct event_pipe {
+    atomic_bool signaled;
+    mtx_t mutex;
+    cnd_t condition;
+    bool manual_reset;
+} event_pipe_t;
 
 struct event_zone_begin {
 	int unsigned tid;
@@ -386,6 +394,11 @@ static struct {
 	int (UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL *orig_server_tick)(void);
 	void *send_maps;
 	void (UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL *orig_send_maps)(void);
+	_Alignas(UTRACY_PAGE_SIZE) struct {
+		char exec_proc[32];
+		char server_tick[32];
+		char send_maps[32];
+	} trampoline;
 } byond;
 
 static struct {
@@ -399,12 +412,8 @@ static struct {
 		long long exec_time;
 	} info;
 
-#if defined(UTRACY_WINDOWS)
-	HANDLE thread;
-#elif defined(UTRACY_LINUX)
-	pthread_t thread;
-#endif
-	event_pipe_t quit;
+	thrd_t thread;
+    event_pipe_t* quit;
 
 	FILE* fstream;
 
@@ -413,134 +422,153 @@ static struct {
 		int unsigned consumer_head_cache;
 		struct event events[EVENT_QUEUE_CAPACITY];
 
-#if defined(__STDC_NO_ATOMICS__)
-		long volatile head;
-		long volatile tail;
-#else
-		_Alignas(64) atomic_uint head;
-		_Alignas(64) atomic_uint tail;
-		_Alignas(64) int padding;
-#endif
+		_Alignas(UTRACY_L1_LINE_SIZE) atomic_uint head;
+		_Alignas(UTRACY_L1_LINE_SIZE) atomic_uint tail;
+		_Alignas(UTRACY_L1_LINE_SIZE) int padding;
 	} queue;
 } utracy;
 
-#if defined(UTRACY_WINDOWS)
-UTRACY_INTERNAL
-event_pipe_t create_event_pipe(bool manual_reset, int initial_state, const char* name) {
-	return CreateEvent(NULL, manual_reset, initial_state, name ? TEXT(name) : NULL);
+event_pipe_t* create_event_pipe(bool manual_reset, bool initial_state) {
+    event_pipe_t* pipe = malloc(sizeof(event_pipe_t));
+    if (!pipe) {
+        return NULL;
+    }
+
+    if (mtx_init(&pipe->mutex, mtx_plain) != thrd_success) {
+        free(pipe);
+        return NULL;
+    }
+
+    if (cnd_init(&pipe->condition) != thrd_success) {
+        mtx_destroy(&pipe->mutex);
+        free(pipe);
+        return NULL;
+    }
+
+    atomic_init(&pipe->signaled, initial_state);
+    pipe->manual_reset = manual_reset;
+    return pipe;
 }
 
-UTRACY_INTERNAL
-void close_event_pipe(event_pipe_t event_pipe) {
-	CloseHandle(event_pipe);
+void close_event_pipe(event_pipe_t* pipe) {
+    if (pipe) {
+        cnd_destroy(&pipe->condition);
+        mtx_destroy(&pipe->mutex);
+        free(pipe);
+    }
 }
 
-UTRACY_INTERNAL
-int wait_for_event_pipe(event_pipe_t event_pipe, int timeout_ms) {
-	DWORD result = WaitForSingleObject(event_pipe, timeout_ms);
-	switch (result) {
-		case WAIT_OBJECT_0: return 0;
-		case WAIT_TIMEOUT: return 1;
-		default: return -1;
-	}
+int wait_for_event_pipe(event_pipe_t* pipe, int timeout_ms) {
+    if (!pipe) {
+        return -1;
+    }
+
+    int result = -1;
+    mtx_lock(&pipe->mutex);
+    
+    if (!atomic_load(&pipe->signaled)) {
+        if (timeout_ms < 0) {
+            // Wait indefinitely
+            while (!atomic_load(&pipe->signaled)) {
+                if (cnd_wait(&pipe->condition, &pipe->mutex) != thrd_success) {
+                    goto cleanup;
+                }
+            }
+            result = 0;
+        } else {
+            // Wait with timeout
+            struct timespec ts;
+            timespec_get(&ts, TIME_UTC);
+            ts.tv_sec += timeout_ms / 1000;
+            ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+            if (ts.tv_nsec >= 1000000000) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000;
+            }
+
+            while (!atomic_load(&pipe->signaled)) {
+                int wait_result = cnd_timedwait(&pipe->condition, &pipe->mutex, &ts);
+                if (wait_result == thrd_timedout) {
+                    result = 1;  // Timeout
+                    goto cleanup;
+                } else if (wait_result != thrd_success) {
+                    goto cleanup;
+                }
+            }
+            result = 0;
+        }
+    } else {
+        result = 0;
+    }
+
+    if (result == 0 && !pipe->manual_reset) {
+        atomic_store(&pipe->signaled, false);
+    }
+
+cleanup:
+    mtx_unlock(&pipe->mutex);
+    return result;
 }
 
-UTRACY_INTERNAL
-void set_event_pipe(event_pipe_t event_pipe) {
-	SetEvent(event_pipe);
+void set_event_pipe(event_pipe_t* pipe) {
+    if (!pipe) {
+        return;
+    }
+
+    mtx_lock(&pipe->mutex);
+    atomic_store(&pipe->signaled, true);
+    cnd_broadcast(&pipe->condition);
+    mtx_unlock(&pipe->mutex);
 }
-#elif defined(UTRACY_LINUX)
-UTRACY_INTERNAL
-event_pipe_t create_event_pipe(bool manual_reset, int initial_state, const char* name) {
-	(void)manual_reset; // Unused on Linux
-	(void)name; // Unused on Linux
-	return eventfd(initial_state ? 1 : 0, EFD_CLOEXEC);
-}
-
-UTRACY_INTERNAL
-void close_event_pipe(event_pipe_t event_pipe) {
-	close(event_pipe);
-}
-
-UTRACY_INTERNAL
-int wait_for_event_pipe(event_pipe_t event_pipe, int timeout_ms) {
-	fd_set fds;
-	struct timeval tv;
-	uint64_t value;
-
-	FD_ZERO(&fds);
-	FD_SET(event_pipe, &fds);
-
-	tv.tv_sec = timeout_ms / 1000;
-	tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-	int result = select(event_pipe + 1, &fds, NULL, NULL, timeout_ms >= 0 ? &tv : NULL);
-	if (result > 0) {
-		if (read(event_pipe, &value, sizeof(value)) == sizeof(value)) {
-			return 0;
-		}
-	} else if (result == 0) {
-		return 1; // Timeout
-	}
-	return -1; // Error
-}
-
-UTRACY_INTERNAL
-void set_event_pipe(event_pipe_t event_pipe) {
-	uint64_t value = 1;
-	(void) write(event_pipe, &value, sizeof(value));
-}
-#endif
-
 
 /* queue api */
 UTRACY_INTERNAL UTRACY_INLINE
 int event_queue_init(void) {
-	utracy.queue.producer_tail_cache = 0;
-	utracy.queue.consumer_head_cache = 0;
+    utracy.queue.producer_tail_cache = 0;
+    utracy.queue.consumer_head_cache = 0;
 	atomic_store_seqcst(&utracy.queue.head, 1);
 	atomic_store_seqcst(&utracy.queue.tail, 0);
-	return 0;
+    return 0;
 }
 
 UTRACY_INTERNAL UTRACY_INLINE
 void event_queue_push(struct event const *const event) {
-	int unsigned store = atomic_load_relaxed(&utracy.queue.head);
-	int unsigned next_store = store + 1;
+    int unsigned store = atomic_load_relaxed(&utracy.queue.head);
+    int unsigned next_store = store + 1;
 
-	if(next_store == EVENT_QUEUE_CAPACITY) {
-		next_store = 0;
-	}
+    if(next_store == EVENT_QUEUE_CAPACITY) {
+        next_store = 0;
+    }
 
-	while(unlikely(next_store == utracy.queue.producer_tail_cache)) {
-		utracy.queue.producer_tail_cache = atomic_load_acquire(&utracy.queue.tail);
-	}
+    while(unlikely(next_store == utracy.queue.producer_tail_cache)) {
+        utracy.queue.producer_tail_cache = atomic_load_acquire(&utracy.queue.tail);
+    }
 
-	utracy.queue.events[store] = *event;
+    utracy.queue.events[store] = *event;
 
-	atomic_store_release(&utracy.queue.head, next_store);
+    atomic_store_release(&utracy.queue.head, next_store);
 }
 
 UTRACY_INTERNAL UTRACY_INLINE
 int event_queue_pop(struct event *const event) {
-	int unsigned load = atomic_load_relaxed(&utracy.queue.tail);
-	int unsigned next_load = load + 1;
+    int unsigned load = atomic_load_relaxed(&utracy.queue.tail);
+    int unsigned next_load = load + 1;
 
-	if(load == utracy.queue.consumer_head_cache) {
-		utracy.queue.consumer_head_cache = atomic_load_acquire(&utracy.queue.head);
-		if(load == utracy.queue.consumer_head_cache) {
-			return -1;
-		}
-	}
+    if(load == utracy.queue.consumer_head_cache) {
+        utracy.queue.consumer_head_cache = atomic_load_acquire(&utracy.queue.head);
+        if(load == utracy.queue.consumer_head_cache) {
+            return -1;
+        }
+    }
 
-	*event = utracy.queue.events[load];
+    *event = utracy.queue.events[load];
 
-	if(next_load == EVENT_QUEUE_CAPACITY) {
-		next_load = 0;
-	}
+    if(next_load == EVENT_QUEUE_CAPACITY) {
+        next_load = 0;
+    }
 
-	atomic_store_release(&utracy.queue.tail, next_load);
-	return 0;
+    atomic_store_release(&utracy.queue.tail, next_load);
+    return 0;
 }
 
 /* profiler */
@@ -751,7 +779,7 @@ struct utracy_source_location {
 	int unsigned color;
 };
 
-static struct utracy_source_location srclocs[0x10002];
+static struct utracy_source_location srclocs[0x14002];
 
 UTRACY_INTERNAL UTRACY_INLINE
 void utracy_emit_zone_begin(int unsigned proc) {
@@ -814,7 +842,8 @@ long long calibrate_delay(void) {
 }
 
 #if 0
-static int utracy_write(void const *const buf, size_t size) {
+UTRACY_INTERNAL
+int utracy_write(void const *const buf, size_t size) {
 	DWORD written;
 	size_t offset = 0;
 	while(offset < size) {
@@ -834,19 +863,33 @@ static int utracy_write(void const *const buf, size_t size) {
 	return 0;
 }
 #else
-static int utracy_write(void const *const buf, size_t size) {
-	fwrite(buf, 1, size, utracy.fstream);
+UTRACY_INTERNAL
+int utracy_write(void const *const buf, size_t size) {
+	if(utracy.fstream != NULL) fwrite(buf, 1, size, utracy.fstream);
 	return 0;
 }
 #endif
 
 UTRACY_INTERNAL
+void utracy_flush(FILE* stream) {
+	if(stream == NULL) {
+		if(utracy.fstream == NULL) {
+			return;
+		}
+		stream = utracy.fstream;
+	}
+	int fd = _fileno(stream);
+	if(fd == -1) return;
 #if defined(UTRACY_WINDOWS)
-DWORD WINAPI utracy_server_thread_start(void* arg) {
+	_commit(fd);
 #elif defined(UTRACY_LINUX)
-void *utracy_server_thread_start(void* arg) {
+	fsync(fd);
 #endif
-	event_pipe_t profiler_connected_event = (event_pipe_t)arg;
+}
+
+UTRACY_INTERNAL
+int utracy_server_thread_start(void* arg) {
+	event_pipe_t* profiler_connected_event = (event_pipe_t*) arg;
 	
 	if (profiler_connected_event) {
 		set_event_pipe(profiler_connected_event);
@@ -953,22 +996,16 @@ void *utracy_server_thread_start(void* arg) {
 		}
 	}
 
-
-#if defined(UTRACY_WINDOWS)
-	CloseHandle(utracy.thread);
-	CloseHandle(utracy.quit);
-
-	ExitThread(0);
-#elif defined(UTRACY_LINUX)
-	close(utracy.quit);
-	pthread_exit(NULL);
-#endif
+	utracy_flush(NULL);
+	close_event_pipe(utracy.quit);
+	utracy.quit = NULL;
+	return 0;
 }
 
 /* byond hooks */
 UTRACY_INTERNAL
 struct object UTRACY_WINDOWS_CDECL UTRACY_LINUX_REGPARM(3) exec_proc(struct proc *proc) {
-	if(likely(proc->procdef < 0x10000)) {
+	if(likely(proc->procdef < 0x14000)) {
 		utracy_emit_zone_begin(proc->procdef);
 
 		/* procs with pre-existing contexts are resuming from sleep */
@@ -991,7 +1028,7 @@ int UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL server_tick(void) {
 	/* server tick is the end of a frame and the beginning of the next frame */
 	utracy_emit_frame_mark(NULL);
 
-	utracy_emit_zone_begin(0x10000);
+	utracy_emit_zone_begin(0x14000);
 
 	int interval = byond.orig_server_tick();
 
@@ -1002,7 +1039,7 @@ int UTRACY_WINDOWS_STDCALL UTRACY_LINUX_CDECL server_tick(void) {
 
 UTRACY_INTERNAL
 void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
-	utracy_emit_zone_begin(0x10001);
+	utracy_emit_zone_begin(0x14001);
 
 	byond.orig_send_maps();
 
@@ -1011,23 +1048,10 @@ void UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL send_maps(void) {
 
 /* hooking */
 UTRACY_INTERNAL
-void *hook(char *const restrict dst, char *const restrict src, char unsigned size) {
+void *hook(char *const restrict dst, char *const restrict src, char unsigned size, char *trampoline) {
 	char unsigned jmp[] = {
 		0xE9, 0x00, 0x00, 0x00, 0x00
 	};
-
-#if defined(UTRACY_WINDOWS)
-	char *trampoline = VirtualAlloc(NULL, 4096, MEM_COMMIT, PAGE_READWRITE);
-
-#elif defined(UTRACY_LINUX)
-	long page_size = sysconf(_SC_PAGE_SIZE);
-	char *trampoline = aligned_alloc(page_size, page_size);
-
-#endif
-
-	if(NULL == trampoline) {
-		return NULL;
-	}
 
 	uintptr_t jmp_from = (uintptr_t) trampoline + size + sizeof(jmp);
 	uintptr_t jmp_to = (uintptr_t) src + size;
@@ -1036,38 +1060,20 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 	(void) UTRACY_MEMCPY(trampoline, src, size);
 	(void) UTRACY_MEMCPY(trampoline + size, jmp, sizeof(jmp));
 
-#if defined(UTRACY_WINDOWS)
-	DWORD old_protect;
-	if(0 == VirtualProtect(trampoline, 4096, PAGE_EXECUTE_READWRITE, &old_protect)) {
-		LOG_DEBUG_ERROR;
-		(void) VirtualFree(trampoline, 0, MEM_RELEASE);
-		return NULL;
-	}
-
-#elif defined(UTRACY_LINUX)
-	if(0 != mprotect(trampoline, page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
-		LOG_DEBUG_ERROR;
-		free(trampoline);
-		return NULL;
-	}
-
-#endif
-
 	jmp_from = (uintptr_t) src + sizeof(jmp);
 	jmp_to = (uintptr_t) dst;
 	offset = jmp_to - jmp_from;
 
 #if defined(UTRACY_WINDOWS)
+	DWORD old_protect;
 	if(0 == VirtualProtect(src, size, PAGE_READWRITE, &old_protect)) {
 		LOG_DEBUG_ERROR;
-		(void) VirtualFree(trampoline, 0, MEM_RELEASE);
 		return NULL;
 	}
 
 #elif defined(UTRACY_LINUX)
-	if(0 != mprotect((void *) ((uintptr_t) src & ((uintptr_t) -page_size)), page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
+	if(0 != mprotect(UTRACY_ALIGN_DOWN(src, UTRACY_PAGE_SIZE), UTRACY_PAGE_SIZE, PROT_WRITE | PROT_READ)) {
 		LOG_DEBUG_ERROR;
-		free(trampoline);
 		return NULL;
 	}
 
@@ -1090,7 +1096,7 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 	}
 
 #elif defined(UTRACY_LINUX)
-	if(0 != mprotect((void *) ((uintptr_t) src & (uintptr_t) -page_size), page_size, PROT_WRITE | PROT_READ | PROT_EXEC)) {
+	if(0 != mprotect(UTRACY_ALIGN_DOWN(src, UTRACY_PAGE_SIZE), UTRACY_PAGE_SIZE, PROT_READ | PROT_EXEC)) {
 		LOG_DEBUG_ERROR;
 		return NULL;
 	}
@@ -1101,7 +1107,7 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 }
 
 #if defined(UTRACY_WINDOWS)
-#	define BYOND_MAX_BUILD 1642
+#	define BYOND_MAX_BUILD 1646
 #	define BYOND_MIN_BUILD 1543
 #	define BYOND_VERSION_ADJUSTED(a) ((a) - BYOND_MIN_BUILD)
 
@@ -1205,12 +1211,16 @@ static int unsigned const byond_offsets[][9] = {
 	[BYOND_VERSION_ADJUSTED(1640)] = {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
 	[BYOND_VERSION_ADJUSTED(1641)] = {0x00409614, 0x00409618, 0x00409624, 0x00409634, 0x001C002C, 0x00130B20, 0x0020BA10, 0x001C3890, 0x00050606},
 	[BYOND_VERSION_ADJUSTED(1642)] = {0x00409614, 0x00409618, 0x00409624, 0x00409634, 0x001C002C, 0x00130B20, 0x0020BAE0, 0x001C3940, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1643)] = {0x0040961C, 0x00409620, 0x0040962C, 0x0040963C, 0x001C002C, 0x00130B20, 0x0020BAD0, 0x001C38E0, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1644)] = {0x004096BC, 0x004096C0, 0x004096CC, 0x004096DC, 0x001C002C, 0x00130D60, 0x0020BD20, 0x001C3B90, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1645)] = {0x0040A6C4, 0x0040A6C8, 0x0040A6D4, 0x0040A6E4, 0x001C002C, 0x00131240, 0x0020C260, 0x001C4060, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1646)] = {0x0040A6C4, 0x0040A6C8, 0x0040A6D4, 0x0040A6E4, 0x001C002C, 0x00131310, 0x0020C300, 0x001C4160, 0x00050606},
 
 	/*                                strings     strings_len miscs       procdefs    procdef     exec_proc   server_tick send_maps   prologue */
 };
 
 #elif defined(UTRACY_LINUX)
-#	define BYOND_MAX_BUILD 1642
+#	define BYOND_MAX_BUILD 1646
 #	define BYOND_MIN_BUILD 1543
 #	define BYOND_VERSION_ADJUSTED(a) ((a) - BYOND_MIN_BUILD)
 
@@ -1312,6 +1322,10 @@ static int unsigned const byond_offsets[][9] = {
 	[BYOND_VERSION_ADJUSTED(1640)] = {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
 	[BYOND_VERSION_ADJUSTED(1641)] = {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
 	[BYOND_VERSION_ADJUSTED(1642)] = {0x006DB818, 0x006DB81C, 0x006DB830, 0x006DB86C, 0x001C002C, 0x00323000, 0x003105C0, 0x00306FC0, 0x00050505},
+	[BYOND_VERSION_ADJUSTED(1643)] = {0x006DB618, 0x006DB61C, 0x006DB630, 0x006DB66C, 0x001C002C, 0x00322E10, 0x00310430, 0x00306E30, 0x00050505},
+	[BYOND_VERSION_ADJUSTED(1644)] = {0x00786DF0, 0x00786DEC, 0x00786DD8, 0x00786D80, 0x001C002C, 0x003486D0, 0x00334490, 0x00322C90, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1645)] = {0x00788DF0, 0x00788DEC, 0x00788DD8, 0x00788D80, 0x001C002C, 0x0034A240, 0x00336000, 0x00324800, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1646)] = {0x00788DF0, 0x00788DEC, 0x00788DD8, 0x00788D80, 0x001C002C, 0x0034A430, 0x003361F0, 0x003249F0, 0x00050606},
 };
 
 #endif
@@ -1324,7 +1338,7 @@ void build_srclocs(void) {
 #define byond_get_procdef_path(procdef) *((int unsigned *)((procdef) + byond.procdef_desc.path))
 #define byond_get_procdef_bytecode(procdef) *((int unsigned *)((procdef) + byond.procdef_desc.bytecode))
 
-	for(int unsigned i=0; i<0x10000; i++) {
+	for(int unsigned i=0; i<0x14000; i++) {
 		char *name = NULL;
 		char *function = "<?>";
 		char *file = "<?.dm>";
@@ -1369,7 +1383,7 @@ void build_srclocs(void) {
 		};
 	}
 
-	srclocs[0x10000] = (struct utracy_source_location) {
+	srclocs[0x14000] = (struct utracy_source_location) {
 		.name = NULL,
 		.function = "ServerTick",
 		.file = __FILE__,
@@ -1377,7 +1391,7 @@ void build_srclocs(void) {
 		.color = 0x44AF44
 	};
 
-	srclocs[0x10001] = (struct utracy_source_location) {
+	srclocs[0x14001] = (struct utracy_source_location) {
 		.name = NULL,
 		.function = "SendMaps",
 		.file = __FILE__,
@@ -1510,27 +1524,42 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 
 	LOG_INFO("byond build = %d\n", byond_build);
 
-	byond.orig_exec_proc = hook((void *) exec_proc, byond.exec_proc, prologues[0]);
+	byond.orig_exec_proc = hook((void *) exec_proc, byond.exec_proc, prologues[0], byond.trampoline.exec_proc);
 	if(NULL == byond.orig_exec_proc) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook exec_proc";
 	}
 
-	byond.orig_server_tick = hook((void *) server_tick, byond.server_tick, prologues[1]);
+	byond.orig_server_tick = hook((void *) server_tick, byond.server_tick, prologues[1], byond.trampoline.server_tick);
 	if(NULL == byond.orig_server_tick) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook server_tick";
 	}
 
-	byond.orig_send_maps = hook((void *) send_maps, byond.send_maps, prologues[2]);
+	byond.orig_send_maps = hook((void *) send_maps, byond.send_maps, prologues[2], byond.trampoline.send_maps);
 	if(NULL == byond.orig_send_maps) {
 		LOG_DEBUG_ERROR;
 		return "failed to hook send_maps";
 	}
 
+#if defined(UTRACY_WINDOWS)
+	DWORD old_protect;
+	if(0 == VirtualProtect(&byond.trampoline, UTRACY_PAGE_SIZE, PAGE_EXECUTE_READ, &old_protect)) {
+		LOG_DEBUG_ERROR;
+		return "failed to set trampoline access protection";
+	}
+
+#elif defined(UTRACY_LINUX)
+	if(0 != mprotect(&byond.trampoline, UTRACY_PAGE_SIZE, PROT_READ | PROT_EXEC)) {
+		LOG_DEBUG_ERROR;
+		return "failed to set trampoline access protection";
+	}
+
+#endif
+
 	build_srclocs();
 
-	utracy.quit = create_event_pipe(true, 0, NULL);
+	utracy.quit = create_event_pipe(true, 0);
 	if (utracy.quit == 0) {
 		LOG_DEBUG_ERROR;
 		return "create_event_pipe(utracy.quit) failed";
@@ -1562,9 +1591,9 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 #define MAX_PATH 260 // same as windows
 #endif
 
-	event_pipe_t profiler_connected_event = 0;
+	event_pipe_t* profiler_connected_event = NULL;
 	if (block_start) {
-		profiler_connected_event = create_event_pipe(true, 0, "ProfilerConnectedEvent");
+		profiler_connected_event = create_event_pipe(true, 0);
 		if (profiler_connected_event == 0) {
 			LOG_DEBUG_ERROR;
 			return "create_event_pipe(profiler_connected_event) failed";
@@ -1587,27 +1616,25 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL init(int argc, char **argv) {
 	utracy.info.exec_time = unix_timestamp();
 	utracy.info.init_end = utracy_tsc();
 
-#if defined(UTRACY_WINDOWS)
-	if(NULL == (utracy.thread = CreateThread(NULL, 0, utracy_server_thread_start, (void*)profiler_connected_event, 0, NULL))) {
-		LOG_DEBUG_ERROR;
-		fclose(utracy.fstream);
-		return "CreateThread failed";
-	}
-#elif defined(UTRACY_LINUX)
-	if (0 != pthread_create(&utracy.thread, NULL, utracy_server_thread_start, (void*)profiler_connected_event)) {
-		LOG_DEBUG_ERROR;
-		return "pthread_create failed";
-	}
-#endif
+	thrd_t thread;
+    if (thrd_create(&thread, utracy_server_thread_start, (void*)profiler_connected_event) != thrd_success) {
+        LOG_DEBUG_ERROR;
+        if (profiler_connected_event) {
+            close_event_pipe(profiler_connected_event);
+        }
+        return "thread creation failed";
+    }
+
+    utracy.thread = thread;
 
 	initialized = true;
 
 	if (block_start) {
 		printf("blocking until initialized\n");
-		wait_for_event_pipe(profiler_connected_event, -1);
+        wait_for_event_pipe(profiler_connected_event, -1);
 		printf("initialized, unblocking\n");
-		close_event_pipe(profiler_connected_event);
-	}
+        close_event_pipe(profiler_connected_event);
+    }
 
 	return ffilename;
 }
@@ -1617,29 +1644,31 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL destroy(int argc, char **argv) {
 	(void) argc;
 	(void) argv;
 
-	/* not yet implemented */
-	if(!initialized) {
-		return "not initialized";
+	if (!initialized) {
+        return "not initialized";
+    } else if (utracy.fstream == NULL) {
+		return "file stream closed";
+	} else if (utracy.quit == NULL) {
+		return "already shutting down";
 	}
 
-	set_event_pipe(utracy.quit);
-#if defined(UTRACY_WINDOWS)
-	switch(WaitForSingleObject(utracy.thread, INFINITE)) {
-		case WAIT_OBJECT_0:
-			break;
-		default:
-			LOG_DEBUG_ERROR;
-	}
-#elif defined(UTRACY_LINUX)
-	void* thread_return;
-	pthread_join(utracy.thread, &thread_return);
-#endif
-	close_event_pipe(utracy.quit);
+    set_event_pipe(utracy.quit);
+    
+    int thread_result;
+    if (thrd_join(utracy.thread, &thread_result) != thrd_success) {
+        LOG_DEBUG_ERROR;
+        return "thread join failed";
+    }
 
-	fclose(utracy.fstream);
-	initialized = false;
+    close_event_pipe(utracy.quit);
+	utracy.quit = NULL;
+	FILE* fstream = utracy.fstream;
+	utracy.fstream = NULL;
+	utracy_flush(fstream);
+    fclose(fstream);
+    initialized = false;
 
-	return "0";
+    return "0";
 }
 
 UTRACY_EXTERNAL
@@ -1651,17 +1680,33 @@ char *UTRACY_WINDOWS_CDECL UTRACY_LINUX_CDECL flush(int argc, char **argv) {
 		return "not initialized";
 	} else if(utracy.fstream == NULL) {
 		return "file stream closed";
+	} else if (utracy.quit == NULL) {
+		return "already shutting down";
 	}
 
-	if(fflush(utracy.fstream) != 0) {
+	// Then ensure it's written to disk
+	int fd = _fileno(utracy.fstream);
+	if(fd == -1) {
 		LOG_DEBUG_ERROR;
-		return "failed to flush file stream";
+		return "failed to get file descriptor";
 	}
+
+#if defined(UTRACY_WINDOWS)
+	if(_commit(fd) != 0) {
+		LOG_DEBUG_ERROR;
+		return "failed to commit file to disk";
+	}
+#elif defined(UTRACY_LINUX)
+	if(fsync(fd) != 0) {
+		LOG_DEBUG_ERROR;
+		return "failed to sync file to disk";
+	}
+#endif
 
 	return "0";
 }
 
-#if (__STDC_HOSTED__ == 0)
+#if (__STDC_HOSTED__ == 0) && defined(UTRACY_WINDOWS)
 BOOL WINAPI DllMainCRTStartup(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 	return TRUE;
 }

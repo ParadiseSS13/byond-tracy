@@ -13,7 +13,7 @@ jobs:
         vsversion: 2022
     - name: Compile byond-tracy
       run: |
-        cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll
+        cl.exe /nologo /std:c11 /O2 /LD /DNDEBUG prof.c ws2_32.lib /Fe:prof.dll /experimental:c11atomics
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -30,7 +30,7 @@ jobs:
         sudo apt-get -y install gcc-multilib
     - name: Compile byond-tracy
       run: |
-        gcc -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
+        gcc -D_FILE_OFFSET_BITS=64 -std=c11 -m32 -shared -fPIC -Ofast -s -DNDEBUG prof.c -pthread -o libprof.so
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
