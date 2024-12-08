@@ -1107,7 +1107,7 @@ void *hook(char *const restrict dst, char *const restrict src, char unsigned siz
 }
 
 #if defined(UTRACY_WINDOWS)
-#	define BYOND_MAX_BUILD 1646
+#	define BYOND_MAX_BUILD 1647
 #	define BYOND_MIN_BUILD 1543
 #	define BYOND_VERSION_ADJUSTED(a) ((a) - BYOND_MIN_BUILD)
 
@@ -1215,6 +1215,7 @@ static int unsigned const byond_offsets[][9] = {
 	[BYOND_VERSION_ADJUSTED(1644)] = {0x004096BC, 0x004096C0, 0x004096CC, 0x004096DC, 0x001C002C, 0x00130D60, 0x0020BD20, 0x001C3B90, 0x00050606},
 	[BYOND_VERSION_ADJUSTED(1645)] = {0x0040A6C4, 0x0040A6C8, 0x0040A6D4, 0x0040A6E4, 0x001C002C, 0x00131240, 0x0020C260, 0x001C4060, 0x00050606},
 	[BYOND_VERSION_ADJUSTED(1646)] = {0x0040A6C4, 0x0040A6C8, 0x0040A6D4, 0x0040A6E4, 0x001C002C, 0x00131310, 0x0020C300, 0x001C4160, 0x00050606},
+	[BYOND_VERSION_ADJUSTED(1647)] = {0x0040A6C4, 0x0040A6C8, 0x0040A6D4, 0x0040A6E4, 0x001C002C, 0x00131260, 0x0020c430, 0x001C4250, 0x00050606},
 
 	/*                                strings     strings_len miscs       procdefs    procdef     exec_proc   server_tick send_maps   prologue */
 };
