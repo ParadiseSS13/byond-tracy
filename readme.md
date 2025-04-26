@@ -16,6 +16,7 @@ A massive thanks to `mafemergency` for even making this possible. The below read
 
 | windows  | linux    |
 | -------- | -------- |
+| 516.1661 | 515.1661 |
 | 516.1660 | 515.1660 |
 | 516.1659 | 515.1659 |
 | 516.1658 | 515.1658 |
